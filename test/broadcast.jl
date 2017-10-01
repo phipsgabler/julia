@@ -2,8 +2,7 @@
 
 module TestBroadcastInternals
 
-using Base.Broadcast: broadcast_indices, check_broadcast_indices,
-                      check_broadcast_shape, newindex, _bcs
+using Base.Broadcast: check_broadcast_indices, check_broadcast_shape, newindex, _bcs
 using Base: OneTo
 using Test
 
@@ -20,10 +19,10 @@ using Test
 @test_throws DimensionMismatch _bcs((-1:1, 2:6), (-1:1, 2:5))
 @test_throws DimensionMismatch _bcs((-1:1, 2:5), (2, 2:5))
 
-@test @inferred(broadcast_indices(zeros(3,4), zeros(3,4))) == (OneTo(3),OneTo(4))
-@test @inferred(broadcast_indices(zeros(3,4), zeros(3)))   == (OneTo(3),OneTo(4))
-@test @inferred(broadcast_indices(zeros(3),   zeros(3,4))) == (OneTo(3),OneTo(4))
-@test @inferred(broadcast_indices(zeros(3), zeros(1,4), zeros(1))) == (OneTo(3),OneTo(4))
+@test @inferred(Broadcast.combine_indices(zeros(3,4), zeros(3,4))) == (OneTo(3),OneTo(4))
+@test @inferred(Broadcast.combine_indices(zeros(3,4), zeros(3)))   == (OneTo(3),OneTo(4))
+@test @inferred(Broadcast.combine_indices(zeros(3),   zeros(3,4))) == (OneTo(3),OneTo(4))
+@test @inferred(Broadcast.combine_indices(zeros(3), zeros(1,4), zeros(1))) == (OneTo(3),OneTo(4))
 
 check_broadcast_indices((OneTo(3),OneTo(5)), zeros(3,5))
 check_broadcast_indices((OneTo(3),OneTo(5)), zeros(3,1))
@@ -404,7 +403,7 @@ StrangeType18623(x,y) = (x,y)
 let
     f(A, n) = broadcast(x -> +(x, n), A)
     @test @inferred(f([1.0], 1)) == [2.0]
-    g() = (a = 1; Base.Broadcast._broadcast_eltype(x -> x + a, 1.0))
+    g() = (a = 1; Broadcast._broadcast_eltype(x -> x + a, 1.0))
     @test @inferred(g()) === Float64
 end
 
@@ -427,26 +426,11 @@ Base.getindex(A::Array19745, i::Integer...) = A.data[i...]
 Base.setindex!(A::Array19745, v::Any, i::Integer...) = setindex!(A.data, v, i...)
 Base.size(A::Array19745) = size(A.data)
 
-Base.Broadcast._containertype(::Type{T}) where {T<:Array19745} = Array19745
-
-Base.Broadcast.promote_containertype(::Type{Array19745}, ::Type{Array19745}) = Array19745
-Base.Broadcast.promote_containertype(::Type{Array19745}, ::Type{Array})      = Array19745
-Base.Broadcast.promote_containertype(::Type{Array19745}, ct)                 = Array19745
-Base.Broadcast.promote_containertype(::Type{Array}, ::Type{Array19745})      = Array19745
-Base.Broadcast.promote_containertype(ct, ::Type{Array19745})                 = Array19745
-
-Base.Broadcast.broadcast_indices(::Type{Array19745}, A)      = indices(A)
-Base.Broadcast.broadcast_indices(::Type{Array19745}, A::Ref) = ()
-
-getfield19745(x::Array19745) = x.data
-getfield19745(x)             = x
-
-function Base.Broadcast.broadcast_c(f, ::Type{Array19745}, A, Bs...)
-    T     = Base.Broadcast._broadcast_eltype(f, A, Bs...)
-    shape = Base.Broadcast.broadcast_indices(A, Bs...)
-    dest = Array19745(Array{T}(Base.index_lengths(shape...)))
-    return broadcast!(f, dest, A, Bs...)
-end
+Broadcast.rule(::Type{T}) where {T<:Array19745} = Array19745
+# The aa' test below generates another AbstractArray type. Here, we want Array19745 to win.
+Broadcast.rule(::Type{Array19745}, ::Type{T}) where T = Array19745
+Base.similar(f, r::Broadcast.Result{Array19745}, As...) =
+    Array19745(Array{eltype(r)}(indices(r)))
 
 @testset "broadcasting for custom AbstractArray" begin
     a  = randn(10)
@@ -466,7 +450,7 @@ end
 
 # Test that broadcast's promotion mechanism handles closures accepting more than one argument.
 # (See issue #19641 and referenced issues and pull requests.)
-let f() = (a = 1; Base.Broadcast._broadcast_eltype((x, y) -> x + y + a, 1.0, 1.0))
+let f() = (a = 1; Broadcast._broadcast_eltype((x, y) -> x + y + a, 1.0, 1.0))
     @test @inferred(f()) == Float64
 end
 
@@ -485,7 +469,7 @@ end
 # Test that broadcast treats type arguments as scalars, i.e. containertype yields Any,
 # even for subtypes of abstract array. (https://github.com/JuliaStats/DataArrays.jl/issues/229)
 @testset "treat type arguments as scalars, DataArrays issue 229" begin
-    @test Base.Broadcast.containertype(AbstractArray) == Any
+    @test Broadcast.resulttype(AbstractArray) == Union{}
     @test broadcast(==, [1], AbstractArray) == BitArray([false])
     @test broadcast(==, 1, AbstractArray) == false
 end
@@ -525,3 +509,6 @@ let t = (0, 1, 2)
     o = 1
     @test @inferred(broadcast(+, t, o)) == (1, 2, 3)
 end
+
+# Issue #22180
+@test isequal(convert.(Nullable, [1,2]), [Nullable(1), Nullable(2)])

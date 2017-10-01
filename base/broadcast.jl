@@ -3,63 +3,157 @@
 module Broadcast
 
 using Base.Cartesian
-using Base: linearindices, tail, OneTo, to_shape,
+using Base: Bottom, Indices, OneTo, linearindices, tail, to_shape,
             _msk_end, unsafe_bitgetindex, bitcache_chunks, bitcache_size, dumpbitcache,
             nullable_returntype, null_safe_op, hasvalue, isoperator
 import Base: broadcast, broadcast!
 export broadcast_getindex, broadcast_setindex!, dotview, @__dot__
 
-const ScalarType = Union{Type{Any}, Type{Nullable}}
+# Note: `similar` and `indices` will be overridden below, thus you need to use
+# Base.similar and Base.indices when you want the Base versions.
+
+"""
+    result = Broadcast.Result{ContainerType}()
+    result = Broadcast.Result{ContainerType,ElType}(inds::Indices)
+
+Create an object that specifies the type and (optionally) indices
+of the result (output) of a broadcasting operation.
+
+Using a dedicated type for this information makes it possible to support
+variants of [`broadcast`](@ref) that accept `result` as an argument;
+it prevents an ambiguity of intent that would otherwise arise because
+both types and indices-tuples are among the supported *input*
+arguments to `broadcast`. For example, `parse.(Int, ("1", "2"))` is
+equivalent to `broadcast(parse, Int, ("1", "2"))`, and as a consequence
+it would would be ambiguous if result-type and output-indices information
+were passed as positional arguments to `broadcast`.
+
+You can extract `inds` with `indices(result)`.
+"""
+struct Result{ContainerType,ElType,I<:Union{Void,Indices}}
+    indices::I
+end
+Result{ContainerType}() where ContainerType =
+    Result{ContainerType,Void,Void}(nothing)
+Result{ContainerType,ElType}(inds::Indices) where {ContainerType,ElType} =
+    Result{ContainerType,ElType,typeof(inds)}(inds)
+indices(r::Result) = r.indices
+Base.indices(r::Result) = indices(r)
+Base.eltype(r::Result{ContainerType,ElType}) where {ContainerType,ElType} = ElType
+
+# An AbstractArray type that "loses" in precedence comparisons to all other AbstractArrays
+abstract type BottomArray{T,N} <: AbstractArray{T,N} end
+
+### User-extensible methods (see the Interfaces chapter of the manual) ###
+## Computing the result (output) type
+"""
+    Broadcast.rule(::Type{<:MyContainer}) = MyContainer
+
+Declare that objects of type `MyContainer` have a customized broadcast implementation.
+If you define this method, you are responsible for defining the following method:
+
+    Base.similar(f, r::Broadcast.Result{MyContainer}, As...) = ...
+
+where `f` is the function you're broadcasting, `r` is a [`Broadcast.Result`](@ref)
+indicating the eltype and indices of the output container, and `As...` contains
+the input arguments to `broadcast`.
+"""
+rule(::Type{Bottom}) = Bottom
+rule(::Type{<:Ptr})  = Bottom   # Ptrs act like scalars, not like Ref
+rule(::Type{T}) where T = Bottom   # "scalar" behavior
+rule(::Type{<:Nullable}) = Nullable
+rule(::Type{<:Tuple}) = Tuple
+rule(::Type{<:Ref}) = BottomArray
+rule(::Type{<:AbstractArray}) = BottomArray
+
+"""
+    Broadcast.rule(::Type{S}, ::Type{T}) where {S,T} = U
+
+Indicate how to resolve different broadcast `rule`s. For example,
+
+    Broadcast.rule(::Type{Primary}, ::Type{Secondary}) = Primary
+
+would indicate that `Primary` has precedence over `Secondary`.
+In most cases you do not have to define both orders, and overloading just the
+first argument is less likely to cause method ambiguities.
+
+In general the inputs should not use subtyping, e.g., use `Type{Primary}` rather than
+`Type{<:Primary}`, because `Union{}` (which is a subtype of every type) plays an important
+role in `rule`. As a consequence, if you define binary `rule` methods, when defining unary
+`rule` methods you should typically discard any container type parameters.
+"""
+function rule(::Type{S}, ::Type{T}) where {S,T}
+    # Precedence rules. We avoid ambiguities by having an order in which these tests are performed.
+    S == T && return T
+    S == Union{} && return T
+    T == Union{} && return S
+    S<:AbstractArray && T==BottomArray && return S
+    S==BottomArray && T<:AbstractArray && return T
+    S<:AbstractArray && T<:AbstractArray && return BottomArray # in cases of ambiguity default to BottomArray
+    S<:AbstractArray && return S
+    T<:AbstractArray && return T
+    S == Tuple && return S
+    T == Tuple && return T
+    S == Nullable && return S
+    T == Nullable && return T
+    Bottom
+end
+
+## Computing the result's indices
+indices() = ()
+indices(::Type{T}) where T = ()
+indices(A) = indices(resulttype(A), A)
+indices(::Type{Bottom}, A) = ()
+indices(::Type{Any}, A) = ()
+indices(::Type{Nullable}, A) = ()
+indices(::Type{Tuple}, A) = (OneTo(length(A)),)
+indices(::Type{BottomArray}, A::Ref) = ()
+indices(::Type{<:AbstractArray}, A) = Base.indices(A)
+
+combine_indices(A, B...) = broadcast_shape(indices(A), combine_indices(B...))
+combine_indices(A) = indices(A)
+
+## Allocating the output container
+"""
+    dest = similar(f, r::Broadcast.Result{ContainerType}, As...)
+
+Allocate an output object `dest`, of the type signaled by `ContainerType`,  for [`broadcast`](@ref).
+`f` is the broadcast operations, and `As...` are the arguments supplied to `broadcast`.
+See [`Broadcast.Result`](@ref) and [`Broadcast.rule`](@ref).
+"""
+Base.similar(f, r::Result{BottomArray}, As...) = similar(Array{eltype(r)}, indices(r))
 
 ## Broadcasting utilities ##
-# fallbacks for some special cases
-@inline broadcast(f, x::Number...) = f(x...)
-@inline broadcast(f, t::NTuple{N,Any}, ts::Vararg{NTuple{N,Any}}) where {N} = map(f, t, ts...)
-broadcast!(::typeof(identity), x::Array{T,N}, y::Array{S,N}) where {T,S,N} =
-    size(x) == size(y) ? copy!(x, y) : broadcast_c!(identity, Array, Array, x, y)
+# special cases
+broadcast(f, x::Number...) = f(x...)
+broadcast(f, t::NTuple{N,Any}, ts::Vararg{NTuple{N,Any}}) where {N} = map(f, t, ts...)
+broadcast!(::typeof(identity), x::AbstractArray{T,N}, y::AbstractArray{S,N}) where {T,S,N} =
+    Base.indices(x) == Base.indices(y) ? copy!(x, y) : _broadcast!(identity, x, y)
 
 # special cases for "X .= ..." (broadcast!) assignments
 broadcast!(::typeof(identity), X::AbstractArray, x::Number) = fill!(X, x)
 broadcast!(f, X::AbstractArray, x::Number...) = (@inbounds for I in eachindex(X); X[I] = f(x...); end; X)
 
 # logic for deciding the resulting container type
-_containertype(::Type) = Any
-_containertype(::Type{<:Ptr}) = Any
-_containertype(::Type{<:Tuple}) = Tuple
-_containertype(::Type{<:Ref}) = Array
-_containertype(::Type{<:AbstractArray}) = Array
-_containertype(::Type{<:Nullable}) = Nullable
-containertype(x) = _containertype(typeof(x))
-containertype(ct1, ct2) = promote_containertype(containertype(ct1), containertype(ct2))
-@inline containertype(ct1, ct2, cts...) = promote_containertype(containertype(ct1), containertype(ct2, cts...))
+resulttype(c) = resultt(rule(typeof(c)))
+resulttype(c1, c2) = resultt(resulttype(c1), resulttype(c2))
+resulttype(c1, c2, cs...) = resultt(resulttype(c1), resulttype(c2, cs...))
 
-promote_containertype(::Type{Array}, ::Type{Array}) = Array
-promote_containertype(::Type{Array}, ct) = Array
-promote_containertype(ct, ::Type{Array}) = Array
-promote_containertype(::Type{Tuple}, ::ScalarType) = Tuple
-promote_containertype(::ScalarType, ::Type{Tuple}) = Tuple
-promote_containertype(::Type{Any}, ::Type{Nullable}) = Nullable
-promote_containertype(::Type{Nullable}, ::Type{Any}) = Nullable
-promote_containertype(::Type{T}, ::Type{T}) where {T} = T
-
-## Calculate the broadcast indices of the arguments, or error if incompatible
-# array inputs
-broadcast_indices() = ()
-broadcast_indices(A) = broadcast_indices(containertype(A), A)
-@inline broadcast_indices(A, B...) = broadcast_shape(broadcast_indices(A), broadcast_indices(B...))
-broadcast_indices(::ScalarType, A) = ()
-broadcast_indices(::Type{Tuple}, A) = (OneTo(length(A)),)
-broadcast_indices(::Type{Array}, A::Ref) = ()
-broadcast_indices(::Type{Array}, A) = indices(A)
+resultt(::Type{T}) where T = T
+resultt(::Type{T}, ::Type{T}) where T = T
+# Test both orders so users typically only have to specialize the first argument
+resultt(::Type{S}, ::Type{T}) where {S,T} = _resultt(rule(S, T), rule(T, S))
+_resultt(::Type{S}, ::Type{T}) where {S<:AbstractArray,T<:AbstractArray} = rule(S, T)
+_resultt(::Type{S}, ::Type{T}) where {S,T} = promote_type(S, T)
 
 # shape (i.e., tuple-of-indices) inputs
 broadcast_shape(shape::Tuple) = shape
-@inline broadcast_shape(shape::Tuple, shape1::Tuple, shapes::Tuple...) = broadcast_shape(_bcs(shape, shape1), shapes...)
+broadcast_shape(shape::Tuple, shape1::Tuple, shapes::Tuple...) = broadcast_shape(_bcs(shape, shape1), shapes...)
 # _bcs consolidates two shapes into a single output shape
 _bcs(::Tuple{}, ::Tuple{}) = ()
-@inline _bcs(::Tuple{}, newshape::Tuple) = (newshape[1], _bcs((), tail(newshape))...)
-@inline _bcs(shape::Tuple, ::Tuple{}) = (shape[1], _bcs(tail(shape), ())...)
-@inline function _bcs(shape::Tuple, newshape::Tuple)
+_bcs(::Tuple{}, newshape::Tuple) = (newshape[1], _bcs((), tail(newshape))...)
+_bcs(shape::Tuple, ::Tuple{}) = (shape[1], _bcs(tail(shape), ())...)
+function _bcs(shape::Tuple, newshape::Tuple)
     return (_bcs1(shape[1], newshape[1]), _bcs(tail(shape), tail(newshape))...)
 end
 # _bcs1 handles the logic for a single dimension
@@ -82,7 +176,7 @@ function check_broadcast_shape(shp, Ashp::Tuple)
     _bcsm(shp[1], Ashp[1]) || throw(DimensionMismatch("array could not be broadcast to match destination"))
     check_broadcast_shape(tail(shp), tail(Ashp))
 end
-check_broadcast_indices(shp, A) = check_broadcast_shape(shp, broadcast_indices(A))
+check_broadcast_indices(shp, A) = check_broadcast_shape(shp, indices(A))
 # comparing many inputs
 @inline function check_broadcast_indices(shp, A, As...)
     check_broadcast_indices(shp, A)
@@ -95,6 +189,7 @@ end
 # is appropriate for a particular broadcast array/scalar. `keep` is a
 # NTuple{N,Bool}, where keep[d] == true means that one should preserve
 # I[d]; if false, replace it with Idefault[d].
+# If dot-broadcasting were already defined, this would be `ifelse.(keep, I, Idefault)`.
 @inline newindex(I::CartesianIndex, keep, Idefault) = CartesianIndex(_newindex(I.I, keep, Idefault))
 @inline _newindex(I, keep, Idefault) =
     (ifelse(keep[1], I[1], Idefault[1]), _newindex(tail(I), tail(keep), tail(Idefault))...)
@@ -102,9 +197,9 @@ end
 
 # newindexer(shape, A) generates `keep` and `Idefault` (for use by
 # `newindex` above) for a particular array `A`, given the
-# broadcast_indices `shape`
+# broadcast indices `shape`
 # `keep` is equivalent to map(==, indices(A), shape) (but see #17126)
-@inline newindexer(shape, A) = shapeindexer(shape, broadcast_indices(A))
+@inline newindexer(shape, A) = shapeindexer(shape, indices(A))
 @inline shapeindexer(shape, indsA::Tuple{}) = (), ()
 @inline function shapeindexer(shape, indsA::Tuple)
     ind1 = indsA[1]
@@ -126,10 +221,11 @@ end
     (keep, keeps...), (Idefault, Idefaults...)
 end
 
-Base.@propagate_inbounds _broadcast_getindex(A, I) = _broadcast_getindex(containertype(A), A, I)
-Base.@propagate_inbounds _broadcast_getindex(::Type{Array}, A::Ref, I) = A[]
-Base.@propagate_inbounds _broadcast_getindex(::ScalarType, A, I) = A
-Base.@propagate_inbounds _broadcast_getindex(::Any, A, I) = A[I]
+Base.@propagate_inbounds _broadcast_getindex(::Type{T}, I) where T = T
+Base.@propagate_inbounds _broadcast_getindex(A, I) = _broadcast_getindex(resulttype(A), A, I)
+Base.@propagate_inbounds _broadcast_getindex(::Type{BottomArray}, A::Ref, I) = A[]
+Base.@propagate_inbounds _broadcast_getindex(::Union{Type{Bottom},Type{Any},Type{Nullable}}, A, I) = A
+Base.@propagate_inbounds _broadcast_getindex(::Type, A, I) = A[I]
 
 ## Broadcasting core
 # nargs encodes the number of As arguments (which matches the number
@@ -201,8 +297,11 @@ arguments to `f` unless it is also listed in the `As`,
 as in `broadcast!(f, A, A, B)` to perform `A[:] = broadcast(f, A, B)`.
 """
 @inline broadcast!(f, C::AbstractArray, A, Bs::Vararg{Any,N}) where {N} =
-    broadcast_c!(f, containertype(C), containertype(A, Bs...), C, A, Bs...)
-@inline function broadcast_c!(f, ::Type, ::Type, C, A, Bs::Vararg{Any,N}) where N
+    _broadcast!(f, C, A, Bs...)
+
+# This indirection allows size-dependent implementations (e.g., see the copying `identity`
+# specialization above)
+@inline function _broadcast!(f, C, A, Bs::Vararg{Any,N}) where N
     shape = indices(C)
     @boundscheck check_broadcast_indices(shape, A, Bs...)
     keeps, Idefaults = map_newindexer(shape, A, Bs)
@@ -211,7 +310,9 @@ as in `broadcast!(f, A, A, B)` to perform `A[:] = broadcast(f, A, B)`.
     return C
 end
 
-# broadcast with computed element type
+# broadcast with element type adjusted on-the-fly. This widens the element type of
+# B as needed (allocating a new container and copying previously-computed values) to
+# accomodate any incompatible new elements.
 @generated function _broadcast!(f, B::AbstractArray, keeps::K, Idefaults::ID, As::AT, ::Val{nargs}, iter, st, count) where {K,ID,AT,nargs}
     quote
         $(Expr(:meta, :noinline))
@@ -232,13 +333,14 @@ end
             if S <: eltype(B)
                 @inbounds B[I] = V
             else
-                R = typejoin(eltype(B), S)
-                new = similar(B, R)
+                # This element type doesn't fit in B. Allocate a new B with wider eltype,
+                # copy over old values, and continue
+                newB = Base.similar(B, typejoin(eltype(B), S))
                 for II in Iterators.take(iter, count)
-                    new[II] = B[II]
+                    newB[II] = B[II]
                 end
-                new[I] = V
-                return _broadcast!(f, new, keeps, Idefaults, As, Val(nargs), iter, st, count+1)
+                newB[I] = V
+                return _broadcast!(f, newB, keeps, Idefaults, As, Val(nargs), iter, st, count+1)
             end
             count += 1
         end
@@ -246,56 +348,23 @@ end
     end
 end
 
-# broadcast methods that dispatch on the type found by inference
-function broadcast_t(f, ::Type{Any}, shape, iter, As...)
-    nargs = length(As)
-    keeps, Idefaults = map_newindexer(shape, As)
-    st = start(iter)
-    I, st = next(iter, st)
-    val = f([ _broadcast_getindex(As[i], newindex(I, keeps[i], Idefaults[i])) for i=1:nargs ]...)
-    if val isa Bool
-        B = similar(BitArray, shape)
-    else
-        B = similar(Array{typeof(val)}, shape)
-    end
-    B[I] = val
-    return _broadcast!(f, B, keeps, Idefaults, As, Val(nargs), iter, st, 1)
-end
-@inline function broadcast_t(f, T, shape, iter, A, Bs::Vararg{Any,N}) where N
-    C = similar(Array{T}, shape)
-    keeps, Idefaults = map_newindexer(shape, A, Bs)
-    _broadcast!(f, C, keeps, Idefaults, A, Bs, Val(N), iter)
-    return C
-end
-
-# default to BitArray for broadcast operations producing Bool, to save 8x space
-# in the common case where this is used for logical array indexing; in
-# performance-critical cases where Array{Bool} is desired, one can always
-# use broadcast! instead.
-@inline function broadcast_t(f, ::Type{Bool}, shape, iter, A, Bs::Vararg{Any,N}) where N
-    C = similar(BitArray, shape)
-    keeps, Idefaults = map_newindexer(shape, A, Bs)
-    _broadcast!(f, C, keeps, Idefaults, A, Bs, Val(N), iter)
-    return C
-end
-
 maptoTuple(f) = Tuple{}
 maptoTuple(f, a, b...) = Tuple{f(a), maptoTuple(f, b...).types...}
 
 # An element type satisfying for all A:
 # broadcast_getindex(
-#     containertype(A),
-#     A, broadcast_indices(A)
+#     resulttype(A),
+#     A, indices(A)
 # )::_broadcast_getindex_eltype(A)
-_broadcast_getindex_eltype(A) = _broadcast_getindex_eltype(containertype(A), A)
-_broadcast_getindex_eltype(::ScalarType, T::Type) = Type{T}
-_broadcast_getindex_eltype(::ScalarType, A) = typeof(A)
-_broadcast_getindex_eltype(::Any, A) = eltype(A)  # Tuple, Array, etc.
+_broadcast_getindex_eltype(A) = _broadcast_getindex_eltype(resulttype(A), A)
+_broadcast_getindex_eltype(::Type{Bottom}, ::Type{T}) where T = Type{T}
+_broadcast_getindex_eltype(::Union{Type{Bottom},Type{Any},Type{Nullable}}, A) = typeof(A)
+_broadcast_getindex_eltype(::Type, A) = eltype(A)  # Tuple, Array, etc.
 
 # An element type satisfying for all A:
 # unsafe_get(A)::unsafe_get_eltype(A)
 _unsafe_get_eltype(x::Nullable) = eltype(x)
-_unsafe_get_eltype(T::Type) = Type{T}
+_unsafe_get_eltype(::Type{T}) where T = Type{T}
 _unsafe_get_eltype(x) = typeof(x)
 
 # Inferred eltype of result of broadcast(f, xs...)
@@ -303,46 +372,6 @@ _broadcast_eltype(f, A, As...) =
     Base._return_type(f, maptoTuple(_broadcast_getindex_eltype, A, As...))
 _nullable_eltype(f, A, As...) =
     Base._return_type(f, maptoTuple(_unsafe_get_eltype, A, As...))
-
-# broadcast methods that dispatch on the type of the final container
-@inline function broadcast_c(f, ::Type{Array}, A, Bs...)
-    T = _broadcast_eltype(f, A, Bs...)
-    shape = broadcast_indices(A, Bs...)
-    iter = CartesianRange(shape)
-    if Base._isleaftype(T)
-        return broadcast_t(f, T, shape, iter, A, Bs...)
-    end
-    if isempty(iter)
-        return similar(Array{T}, shape)
-    end
-    return broadcast_t(f, Any, shape, iter, A, Bs...)
-end
-@inline function broadcast_c(f, ::Type{Nullable}, a...)
-    nonnull = all(hasvalue, a)
-    S = _nullable_eltype(f, a...)
-    if Base._isleaftype(S) && null_safe_op(f, maptoTuple(_unsafe_get_eltype,
-                                                         a...).types...)
-        Nullable{S}(f(map(unsafe_get, a)...), nonnull)
-    else
-        if nonnull
-            Nullable(f(map(unsafe_get, a)...))
-        else
-            Nullable{nullable_returntype(S)}()
-        end
-    end
-end
-@inline broadcast_c(f, ::Type{Any}, a...) = f(a...)
-@inline broadcast_c(f, ::Type{Tuple}, A, Bs...) =
-    tuplebroadcast(f, first_tuple(A, Bs...), A, Bs...)
-@inline tuplebroadcast(f, ::NTuple{N,Any}, As...) where {N} =
-    ntuple(k -> f(tuplebroadcast_getargs(As, k)...), Val(N))
-@inline tuplebroadcast(f, ::NTuple{N,Any}, ::Type{T}, As...) where {N,T} =
-    ntuple(k -> f(T, tuplebroadcast_getargs(As, k)...), Val(N))
-first_tuple(A::Tuple, Bs...) = A
-@inline first_tuple(A, Bs...) = first_tuple(Bs...)
-tuplebroadcast_getargs(::Tuple{}, k) = ()
-@inline tuplebroadcast_getargs(As, k) =
-    (_broadcast_getindex(first(As), k), tuplebroadcast_getargs(tail(As), k)...)
 
 """
     broadcast(f, As...)
@@ -431,7 +460,109 @@ julia> (1 + im) ./ Nullable{Int}()
 Nullable{Complex{Float64}}()
 ```
 """
-@inline broadcast(f, A, Bs...) = broadcast_c(f, containertype(A, Bs...), A, Bs...)
+broadcast(f, A, Bs...) = broadcast(f,
+                                   Result{resulttype(A, Bs...)}(),
+                                   A, Bs...)
+
+"""
+    broadcast(f, Broadcast.Result{ContainerType}(), As...)
+
+Specify the container-type of the output of a broadcasting operation.
+You can specialize such calls as
+
+    function Broadcast.broadcast(f, ::Broadcast.Result{ContainerType,Void,Void}, As...) where ContainerType
+        ...
+    end
+"""
+function broadcast(f, ::Result{ContainerType,Void,Void}, A, Bs...) where ContainerType
+    ElType = _broadcast_eltype(f, A, Bs...)
+    broadcast(f,
+              Result{ContainerType,ElType}(combine_indices(A, Bs...)),
+              A, Bs...)
+end
+
+"""
+    broadcast(f, Broadcast.Result{ContainerType,ElType}(indices), As...)
+
+Specify the container-type, element-type, and indices of the output
+of a broadcasting operation. You can specialize such calls as
+
+    function Broadcast.broadcast(f, r::Broadcast.Result{ContainerType,ElType,<:Tuple}, As...) where {ContainerType,ElType}
+        ...
+    end
+
+This variant might be the most convenient specialization for container types
+that don't support [`setindex!`](@ref) and therefore can't use [`broadcast!`](@ref).
+"""
+function broadcast(f, result::Result{ContainerType,ElType,<:Indices}, As...) where {ContainerType,ElType}
+    if !Base._isleaftype(ElType)
+        return broadcast_nonleaf(f, result, As...)
+    end
+    dest = similar(f, result, As...)
+    broadcast!(f, dest, As...)
+end
+
+# default to BitArray for broadcast operations producing Bool, to save 8x space
+# in the common case where this is used for logical array indexing; in
+# performance-critical cases where Array{Bool} is desired, one can always
+# use broadcast! instead.
+function broadcast(f, r::Result{BottomArray,Bool}, As...)
+    dest = Base.similar(BitArray, indices(r))
+    broadcast!(f, dest, As...)
+end
+
+# When ElType is not concrete, use narrowing. Use the first element of each input to determine
+# the starting output eltype; the _broadcast! method will widen `dest` as needed to
+# accomodate later values.
+function broadcast_nonleaf(f, r::Result{BottomArray,ElType,<:Indices}, As...) where ElType
+    nargs = length(As)
+    shape = indices(r)
+    iter = CartesianRange(shape)
+    if isempty(iter)
+        return Base.similar(Array{ElType}, shape)
+    end
+    keeps, Idefaults = map_newindexer(shape, As)
+    st = start(iter)
+    I, st = next(iter, st)
+    val = f([ _broadcast_getindex(As[i], newindex(I, keeps[i], Idefaults[i])) for i=1:nargs ]...)
+    if val isa Bool
+        dest = Base.similar(BitArray, shape)
+    else
+        dest = Base.similar(Array{typeof(val)}, shape)
+    end
+    dest[I] = val
+    return _broadcast!(f, dest, keeps, Idefaults, As, Val(nargs), iter, st, 1)
+end
+
+@inline function broadcast(f, r::Result{<:Nullable,Void,Void}, a...)
+    nonnull = all(hasvalue, a)
+    S = _nullable_eltype(f, a...)
+    if Base._isleaftype(S) && null_safe_op(f, maptoTuple(_unsafe_get_eltype,
+                                                         a...).types...)
+        Nullable{S}(f(map(unsafe_get, a)...), nonnull)
+    else
+        if nonnull
+            Nullable(f(map(unsafe_get, a)...))
+        else
+            Nullable{nullable_returntype(S)}()
+        end
+    end
+end
+
+broadcast(f, ::Result{Bottom,Void,Void}, a...) = f(a...)
+
+broadcast(f, ::Result{Tuple,Void,Void}, A, Bs...) =
+    tuplebroadcast(f, first_tuple(A, Bs...), A, Bs...)
+tuplebroadcast(f, ::NTuple{N,Any}, As...) where {N} =
+    ntuple(k -> f(tuplebroadcast_getargs(As, k)...), Val(N))
+tuplebroadcast(f, ::NTuple{N,Any}, ::Type{T}, As...) where {N,T} =
+    ntuple(k -> f(T, tuplebroadcast_getargs(As, k)...), Val(N))
+first_tuple(A::Tuple, Bs...) = A
+first_tuple(A, Bs...) = first_tuple(Bs...)
+tuplebroadcast_getargs(::Tuple{}, k) = ()
+tuplebroadcast_getargs(As, k) =
+    (_broadcast_getindex(first(As), k), tuplebroadcast_getargs(tail(As), k)...)
+
 
 """
     broadcast_getindex(A, inds...)
@@ -473,7 +604,11 @@ julia> broadcast_getindex(C,[1,2,10])
  15
 ```
 """
-broadcast_getindex(src::AbstractArray, I::AbstractArray...) = broadcast_getindex!(similar(Array{eltype(src)}, broadcast_indices(I...)), src, I...)
+broadcast_getindex(src::AbstractArray, I::AbstractArray...) =
+    broadcast_getindex!(Base.similar(Array{eltype(src)}, combine_indices(I...)),
+                        src,
+                        I...)
+
 @generated function broadcast_getindex!(dest::AbstractArray, src::AbstractArray, I::AbstractArray...)
     N = length(I)
     Isplat = Expr[:(I[$d]) for d = 1:N]
@@ -481,7 +616,7 @@ broadcast_getindex(src::AbstractArray, I::AbstractArray...) = broadcast_getindex
         @nexprs $N d->(I_d = I[d])
         check_broadcast_indices(indices(dest), $(Isplat...))  # unnecessary if this function is never called directly
         checkbounds(src, $(Isplat...))
-        @nexprs $N d->(@nexprs $N k->(Ibcast_d_k = indices(I_k, d) == OneTo(1)))
+        @nexprs $N d->(@nexprs $N k->(Ibcast_d_k = Base.indices(I_k, d) == OneTo(1)))
         @nloops $N i dest d->(@nexprs $N k->(j_d_k = Ibcast_d_k ? 1 : i_d)) begin
             @nexprs $N k->(@inbounds J_k = @nref $N I_k d->j_d_k)
             @inbounds (@nref $N dest i) = (@nref $N src J)
@@ -502,9 +637,9 @@ position in `X` at the indices in `A` given by the same positions in `inds`.
     quote
         @nexprs $N d->(I_d = I[d])
         checkbounds(A, $(Isplat...))
-        shape = broadcast_indices($(Isplat...))
+        shape = combine_indices($(Isplat...))
         @nextract $N shape d->(length(shape) < d ? OneTo(1) : shape[d])
-        @nexprs $N d->(@nexprs $N k->(Ibcast_d_k = indices(I_k, d) == 1:1))
+        @nexprs $N d->(@nexprs $N k->(Ibcast_d_k = Base.indices(I_k, d) == 1:1))
         if !isa(x, AbstractArray)
             xA = convert(eltype(A), x)
             @nloops $N i d->shape_d d->(@nexprs $N k->(j_d_k = Ibcast_d_k ? 1 : i_d)) begin

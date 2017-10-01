@@ -371,3 +371,132 @@ If you are defining an array type that allows non-traditional indexing (indices 
 something other than 1), you should specialize `indices`. You should also specialize [`similar`](@ref)
 so that the `dims` argument (ordinarily a `Dims` size-tuple) can accept `AbstractUnitRange` objects,
 perhaps range-types `Ind` of your own design. For more information, see [Arrays with custom indices](@ref).
+
+## Specializing broadcasting
+
+| Methods to implement | Brief description |
+|:-------------------- |:----------------- |
+| `Broadcast.rule(::Type{SrcType}) = ContainerType` | Output type produced by broadcasting `SrcType` |
+| `similar(f, r::Broadcast.Result{ContainerType}, As...)` | Allocation of output container |
+| **Optional methods** | | |
+| `Broadcast.rule(::Type{ContainerType1}, ::Type{ContainerType2}) = ContainerType` | Precedence rules for output type |
+| `Broadcast.indices(::Type, A)` | Declaration of the indices of `A` for broadcasting purposes (for AbstractArrays, defaults to `Base.indices(A)`) |
+| **Bypassing default machinery** | |
+| `broadcast(f, As...)` | Complete bypass of broadcasting machinery |
+| `broadcast(f, r::Broadcast.Result{ContainerType,Void,Void}, As...)` | Bypass after container type is computed |
+| `broadcast(f, r::Broadcast.Result{ContainerType,ElType,<:Tuple}, As...)` | Bypass after container type, eltype, and indices are computed |
+
+[Broadcasting](@ref) is triggered by an explicit call to `broadcast` or `broadcast!`, or implicitly by
+"dot" operations like `A .+ b`. Any `AbstractArray` type supports broadcasting,
+but the default result (output) type is `Array`. To specialize the result for specific input type(s),
+the main task is the allocation of an appropriate result object.
+(This is not an issue for `broadcast!`, where
+the result object is passed as an argument.) This process is split into two stages: computation
+of the type from the arguments ([`Broadcast.rule`](@ref)), and allocation of the object
+given the resulting type with a broadcast-specific ([`similar`](@ref)).
+
+`Broadcast.rule` is somewhat analogous to [`promote_rule`](@ref), except that you
+may only need to define a unary variant. The unary variant simply states that you intend to
+handle broadcasting for this type, and do not wish to rely on the default fallback. Most
+implementations will be simple:
+
+```julia
+Broadcast.rule(::Type{<:MyType}) = MyType
+```
+where unary `rule` should typically discard type parameters so that any binary `rule` methods
+can be concrete (without using `<:` for type arguments).
+
+For `AbstractArray` types, this prevents the fallback choice, `Broadcast.BottomArray`,
+which is an `AbstractArray` type that "loses" to every other `AbstractArray` type in a binary call
+`Broadcast.rule(S, T)` for two types `S` and `T`.
+You do not need to write a binary `rule` unless you want to establish precedence for
+two or more non-`BottomArray` types. If you do write a binary rule, you do not need to
+supply the types in both orders, as internal machinery will try both.
+
+The actual allocation of the result array is handled by specialized implementations of `similar`:
+
+```julia
+Base.similar(f, r::Broadcast.Result{ContainerType}, As...)
+```
+
+`f` is the operation being performed, `ContainerType` signals the resulting container type
+(e.g., `Broadcast.BottomArray`, `Tuple`, etc.).
+`eltype(r)` returns the element type, and `indices(r)` the object's indices.
+`As...` is the list of input objects. You may not need to use `f` or `As...`
+unless they help you build the appropriate object; the fallback definition is
+
+```julia
+Base.similar(f, r::Broadcast.Result{BottomArray}, As...) = similar(Array{eltype(r)}, indices(r))
+```
+
+However, if needed you can specialize on any or all of these arguments.
+
+For a complete example, let's say you have created a type, `ArrayAndChar`, that stores an
+array and a single character:
+
+```jldoctest
+struct ArrayAndChar{T,N} <: AbstractArray{T,N}
+    data::Array{T,N}
+    char::Char
+end
+Base.size(A::ArrayAndChar) = size(A.data)
+Base.getindex(A::ArrayAndChar{T,N}, inds::Vararg{Int,N}) where {T,N} = A.data[inds...]
+Base.setindex!(A::ArrayAndChar{T,N}, val, inds::Vararg{Int,N}) where {T,N} = A.data[inds...] = val
+Base.showarg(io::IO, A::ArrayAndChar, toplevel) = print(io, typeof(A), " with char '", A.char, "'")
+```
+
+You might want broadcasting to preserve the `char` "metadata." First we define
+
+```jldoctest
+Broadcast.rule(::Type{AC}) where AC<:ArrayAndChar = ArrayAndChar
+```
+
+This forces us to also define a `similar` method:
+```jldoctest
+function Base.similar(f, r::Broadcast.Result{ArrayAndChar}, As...)
+    # Scan the inputs for the ArrayAndChar:
+    A = find_aac(As...)
+    # Use the char field of A to create the output
+    ArrayAndChar(similar(Array{eltype(r)}, indices(r)), A.char)
+end
+
+"`A = find_aac(As...)` returns the first ArrayAndChar among the arguments."
+find_aac(A::ArrayAndChar, B...) = A
+find_aac(A, B...) = find_aac(B...)
+```
+
+From these definitions, one obtains the following behavior:
+```jldoctest
+julia> a = ArrayAndChar([1 2; 3 4], 'x')
+2×2 ArrayAndChar{Int64,2} with char 'x':
+ 1  2
+ 3  4
+
+julia> a .+ 1
+2×2 ArrayAndChar{Int64,2} with char 'x':
+ 2  3
+ 4  5
+
+julia> a .+ [5,10]
+2×2 ArrayAndChar{Int64,2} with char 'x':
+  6   7
+ 13  14
+```
+
+Finally, it's worth noting that sometimes it's easier simply to bypass the machinery for
+computing result types and container sizes, and just do everything manually. For example,
+you can convert a `UnitRange{Int}` `rng` to a `UnitRange{BigInt}` with `big.(rng)`; the definition
+of this method is approximately
+
+```julia
+Broadcast.broadcast(::typeof(big), rng::UnitRange) = big(first(rng)):big(last(rng))
+```
+
+This exploits Julia's ability to dispatch on a particular function type. (This kind of
+explicit definition can indeed be necessary if the output container does not support `setindex!`.)
+You can optionally choose to implement the actual broadcasting yourself, but allow
+the internal machinery to compute the container type, element type, and indices by specializing
+
+```julia
+Broadcast.broadcast(::typeof(somefunction), r::Broadcast.Result{ContainerType,ElType,<:Tuple}, As...)
+```
